@@ -10,6 +10,7 @@ and ecosystem tests pass, and an adversarial Codex review has been remediated.
 ## Documents
 
 - **[Service specification](docs/SPEC.md) — start here**
+- [API testing guide](docs/api-testing-guide.md) — hands-on HTTP/SDK examples
 - [Research and API contract](docs/research.md)
 - [Architecture and threat model](docs/architecture.md)
 - [Compatibility contract](docs/compatibility.md)
