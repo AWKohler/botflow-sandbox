@@ -21,13 +21,20 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   btrfs-progs ca-certificates curl debootstrap e2fsprogs iproute2 jq nftables openssl xz-utils
 
-getent group sandbox-host >/dev/null || groupadd --system sandbox-host
-id sandbox-api >/dev/null 2>&1 || useradd --system --gid sandbox-host --home-dir /nonexistent --shell /usr/sbin/nologin sandbox-api
-id sandbox-egress >/dev/null 2>&1 || useradd --system --gid sandbox-host --home-dir /nonexistent --shell /usr/sbin/nologin sandbox-egress
-group_gid=$(getent group sandbox-host | cut -d: -f3)
+# Dedicated per-service users and PRIMARY groups. Separate groups keep the
+# egress<->runtime and API<->runtime control paths isolated: only sandbox-api
+# can reach the runtime socket, and only root/sandbox-egress the egress socket.
+getent group sandbox-api >/dev/null || groupadd --system sandbox-api
+getent group sandbox-egress >/dev/null || groupadd --system sandbox-egress
+if id sandbox-api >/dev/null 2>&1; then usermod --gid sandbox-api sandbox-api; else useradd --system --gid sandbox-api --home-dir /nonexistent --shell /usr/sbin/nologin sandbox-api; fi
+if id sandbox-egress >/dev/null 2>&1; then usermod --gid sandbox-egress sandbox-egress; else useradd --system --gid sandbox-egress --home-dir /nonexistent --shell /usr/sbin/nologin sandbox-egress; fi
+api_gid=$(getent group sandbox-api | cut -d: -f3)
 
 install -d -m 0755 /usr/lib/sandbox-host /etc/sandbox-host /srv/jailer
-install -d -o root -g sandbox-host -m 0770 /run/sandbox-host
+# /run/sandbox-host holds only the runtime socket, created by root sandboxd.
+# World-traversable so the API can connect to the socket (whose group is
+# sandbox-api); no service other than root may create files here.
+install -d -o root -g root -m 0755 /run/sandbox-host
 install -m 0755 "$STAGE/sandbox-api" /usr/lib/sandbox-host/sandbox-api
 install -m 0755 "$STAGE/sandboxd" /usr/lib/sandbox-host/sandboxd
 install -m 0755 "$STAGE/egressd" /usr/lib/sandbox-host/egressd
@@ -52,13 +59,21 @@ if ! findmnt -rn "$DATA_DIR" >/dev/null; then
   grep -q "UUID=$store_uuid" /etc/fstab || echo "UUID=$store_uuid $DATA_DIR btrfs loop,noatime,compress=zstd:1,space_cache=v2,nofail 0 0" >> /etc/fstab
   mount "$DATA_DIR"
 fi
-install -d -o sandbox-api -g sandbox-host -m 0770 "$DATA_DIR"
-install -d -o root -g sandbox-host -m 0750 "$DATA_DIR/images" "$DATA_DIR/instances" "$DATA_DIR/snapshots" "$DATA_DIR/runtime" "$DATA_DIR/jailer"
+# Data root is root-owned and NOT writable by any service user, so a compromised
+# API/egress process cannot rename or replace the runtime-state, image, or
+# snapshot directories that root sandboxd trusts. The API gets its own private
+# subdirectory for the database only.
+install -d -o root -g root -m 0755 "$DATA_DIR"
+install -d -o root -g root -m 0750 "$DATA_DIR/images" "$DATA_DIR/instances" "$DATA_DIR/snapshots" "$DATA_DIR/runtime" "$DATA_DIR/jailer"
+install -d -o sandbox-api -g sandbox-api -m 0700 "$DATA_DIR/api"
+# Migrate a database created by an earlier layout into the API-private dir.
+if [[ -f "$DATA_DIR/api.db" && ! -f "$DATA_DIR/api/api.db" ]]; then
+  mv "$DATA_DIR/api.db" "$DATA_DIR/api/api.db"
+  chown sandbox-api:sandbox-api "$DATA_DIR/api/api.db"
+fi
 
 install -m 0644 "$STAGE/egress.json" /etc/sandbox-host/egress.json
 install -m 0644 "$STAGE/nftables.conf" /etc/sandbox-host/nftables.conf
-token=$(openssl rand -base64 36 | tr -d '\n')
-token_hash=$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)
 
 cat > /etc/sandbox-host/runtime.json <<EOF
 {
@@ -67,16 +82,26 @@ cat > /etc/sandbox-host/runtime.json <<EOF
   "firecrackerBinary": "/usr/bin/firecracker",
   "jailerBinary": "/usr/bin/jailer",
   "kernelPath": "/usr/lib/sandbox-host/vmlinux",
-  "egressSocket": "/run/sandbox-host/egress.sock",
+  "egressSocket": "/run/sandbox-egress/egress.sock",
   "listenSocket": "/run/sandbox-host/sandboxd.sock",
   "region": "local-nyc",
   "hostReserveMiB": 4096,
+  "storageReserveMiB": 20480,
   "maxVcpus": 8,
   "cpuOvercommit": 1.0,
-  "socketGid": $group_gid,
+  "socketGid": $api_gid,
   "allowedRuntimes": ["node22", "node24", "node26", "python3.13"]
 }
 EOF
+
+# Preserve an existing admin token across re-runs; only mint one on first install.
+if [[ -f /etc/sandbox-host/api.json ]]; then
+  token_hash=$(jq -r '.tokens[0].sha256' /etc/sandbox-host/api.json)
+  token=""
+else
+  token=$(openssl rand -base64 36 | tr -d '\n')
+  token_hash=$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)
+fi
 cat > /etc/sandbox-host/api.json <<EOF
 {
   "listen": "127.0.0.1:8080",
@@ -84,7 +109,7 @@ cat > /etc/sandbox-host/api.json <<EOF
   "previewExternalHost": "$TAILSCALE_HOST",
   "previewPortStart": 20000,
   "previewPortEnd": 40000,
-  "databasePath": "$DATA_DIR/api.db",
+  "databasePath": "$DATA_DIR/api/api.db",
   "runtimeSocket": "/run/sandbox-host/sandboxd.sock",
   "region": "local-nyc",
   "defaultTimeoutMs": 300000,
@@ -95,20 +120,25 @@ cat > /etc/sandbox-host/api.json <<EOF
 }
 EOF
 chmod 0640 /etc/sandbox-host/*.json
-chown root:sandbox-host /etc/sandbox-host/*.json
+chown root:sandbox-api /etc/sandbox-host/api.json
+chown root:sandbox-egress /etc/sandbox-host/egress.json
+chown root:root /etc/sandbox-host/runtime.json /etc/sandbox-host/nftables.conf
 
 install -m 0755 "$STAGE/build-rootfs.sh" /usr/lib/sandbox-host/build-rootfs.sh
 install -m 0644 "$STAGE/systemd"/*.service "$STAGE/systemd"/*.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable sandbox-host-firewall.service sandbox-host-egress.service sandbox-host-runtime.service sandbox-host-api.service sandbox-host-gc.timer
 
-cat > /home/ai-club-pc/sandbox-host-credentials <<EOF
+# Only (re)write the operator credentials file when a fresh token was minted.
+if [[ -n "$token" ]]; then
+  cat > /home/ai-club-pc/sandbox-host-credentials <<EOF
 SANDBOX_API_URL=https://$TAILSCALE_HOST/api
 SANDBOX_TOKEN=$token
 SANDBOX_TEAM_ID=default
 SANDBOX_PROJECT_ID=default
 EOF
-chown ai-club-pc:ai-club-pc /home/ai-club-pc/sandbox-host-credentials
-chmod 0600 /home/ai-club-pc/sandbox-host-credentials
+  chown ai-club-pc:ai-club-pc /home/ai-club-pc/sandbox-host-credentials
+  chmod 0600 /home/ai-club-pc/sandbox-host-credentials
+fi
 
 echo "Host prerequisites installed. Build the guest image, then start services."

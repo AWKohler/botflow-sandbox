@@ -57,6 +57,52 @@ func TestPolicyStateRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHTTPHostPort80(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantOK   bool
+	}{
+		{"registry.npmjs.org", "registry.npmjs.org", true},
+		{"registry.npmjs.org:80", "registry.npmjs.org", true},
+		{"registry.npmjs.org:22", "registry.npmjs.org:22", false},
+		{"registry.npmjs.org:443", "registry.npmjs.org:443", false},
+		{"github.com:8080", "github.com:8080", false},
+	}
+	for _, tc := range cases {
+		host, ok := httpHostPort80(tc.in)
+		if ok != tc.wantOK || (ok && host != tc.wantHost) {
+			t.Fatalf("httpHostPort80(%q) = %q, %v; want %q, %v", tc.in, host, ok, tc.wantHost, tc.wantOK)
+		}
+	}
+}
+
+func TestConnAdmission(t *testing.T) {
+	s := &server{connBySrc: make(map[string]int)}
+	for i := 0; i < maxConnsPerSource; i++ {
+		if !s.admitConn("10.200.0.2") {
+			t.Fatalf("admit %d should have succeeded", i)
+		}
+	}
+	if s.admitConn("10.200.0.2") {
+		t.Fatal("per-source ceiling should reject the next connection")
+	}
+	if !s.admitConn("10.200.0.6") {
+		t.Fatal("a different source must not be blocked by another source's count")
+	}
+	s.releaseConn("10.200.0.2")
+	if !s.admitConn("10.200.0.2") {
+		t.Fatal("a released slot should be reusable")
+	}
+	// Fully drain the first source and confirm the map entry is reclaimed.
+	for s.connBySrc["10.200.0.2"] > 0 {
+		s.releaseConn("10.200.0.2")
+	}
+	if _, ok := s.connBySrc["10.200.0.2"]; ok {
+		t.Fatal("drained source should be removed from the map")
+	}
+}
+
 func TestDNSQuestionName(t *testing.T) {
 	packet := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0,
 		8, 'r', 'e', 'g', 'i', 's', 't', 'r', 'y', 5, 'n', 'p', 'm', 'j', 's', 3, 'o', 'r', 'g', 0,

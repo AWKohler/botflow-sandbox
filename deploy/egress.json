@@ -1,6 +1,6 @@
 {
   "dnsUpstream": "1.1.1.1:53",
-  "statePath": "/run/sandbox-host/egress-state.json",
+  "statePath": "/run/sandbox-egress/egress-state.json",
   "ceiling": {
     "rules": [
       { "domain": "registry.npmjs.org" },

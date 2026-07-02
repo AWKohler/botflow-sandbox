@@ -41,6 +41,7 @@ type config struct {
 	ListenSocket      string   `json:"listenSocket"`
 	Region            string   `json:"region"`
 	HostReserveMiB    int64    `json:"hostReserveMiB"`
+	StorageReserveMiB int64    `json:"storageReserveMiB"`
 	MaxVCPUs          int      `json:"maxVcpus"`
 	CPUOvercommit     float64  `json:"cpuOvercommit"`
 	AllowedRuntimes   []string `json:"allowedRuntimes"`
@@ -110,6 +111,9 @@ func setConfigDefaults(c *config) {
 	if c.HostReserveMiB == 0 {
 		c.HostReserveMiB = 4096
 	}
+	if c.StorageReserveMiB == 0 {
+		c.StorageReserveMiB = 20480
+	}
 	if c.MaxVCPUs == 0 {
 		c.MaxVCPUs = 8
 	}
@@ -157,6 +161,7 @@ func (d *daemon) serve(ctx context.Context) error {
 		httpjson.Write(w, 200, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /v1/capacity", d.capacityHandler)
+	mux.HandleFunc("GET /v1/sessions", d.listSessions)
 	mux.HandleFunc("POST /v1/sessions", d.createSession)
 	mux.HandleFunc("POST /v1/sessions/{id}/stop", d.stopSession)
 	mux.HandleFunc("PUT /v1/sessions/{id}/network-policy", d.updatePolicy)
@@ -256,16 +261,59 @@ func (d *daemon) validateCreate(req runtimeproto.CreateSessionRequest) error {
 	return nil
 }
 
+// perGuestOverheadMiB matches the slack added to each guest's cgroup memory.max
+// in startFirecracker; committed-memory accounting must use the same figure.
+const perGuestOverheadMiB = 256
+
 func (d *daemon) admitLocked(req runtimeproto.CreateSessionRequest) error {
 	capacity := d.capacityLocked()
+	// Instantaneous safety: never let real free memory dip below the reserve.
 	if capacity.AvailableMemoryMiB-int64(req.MemoryMiB) < d.config.HostReserveMiB {
 		return errors.New("host memory reserve would be violated")
+	}
+	// Committed safety: MemAvailable counts a guest's not-yet-resident RAM as
+	// free, so rapid creation could oversubscribe physical memory and OOM the
+	// host once guests fault their pages in. Bound the sum of committed guest
+	// footprints against MemTotal minus the reserve.
+	committed := int64(0)
+	for _, s := range d.sessions {
+		committed += int64(s.MemoryMiB) + perGuestOverheadMiB
+	}
+	if capacity.TotalMemoryMiB-committed-(int64(req.MemoryMiB)+perGuestOverheadMiB) < d.config.HostReserveMiB {
+		return errors.New("host committed-memory ceiling reached")
 	}
 	limit := int(float64(capacity.LogicalCPUs) * d.config.CPUOvercommit)
 	if capacity.AllocatedVCPUs+req.VCPUs > limit {
 		return errors.New("host CPU allocation ceiling reached")
 	}
+	// Storage safety: reflink clones start near-zero but grow as guests write.
+	// Refuse new sandboxes once the backing store nears full so a tenant filling
+	// a disk cannot starve the database, snapshots, or other guests.
+	if freeMiB, err := freeDiskMiB(d.config.DataDir); err == nil && freeMiB < d.config.StorageReserveMiB {
+		return errors.New("host storage reserve would be violated")
+	}
 	return nil
+}
+
+func freeDiskMiB(path string) (int64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return int64(st.Bavail) * int64(st.Bsize) / (1024 * 1024), nil
+}
+
+// listSessions returns the IDs of every live runtime session. The API uses this
+// as the authoritative liveness source to reconcile its own records after a
+// host reboot, transitioning DB rows whose VM no longer exists to stopped.
+func (d *daemon) listSessions(w http.ResponseWriter, _ *http.Request) {
+	d.mu.Lock()
+	ids := make([]string, 0, len(d.sessions))
+	for id := range d.sessions {
+		ids = append(ids, id)
+	}
+	d.mu.Unlock()
+	httpjson.Write(w, 200, map[string]any{"sessions": ids})
 }
 
 func (d *daemon) capacityHandler(w http.ResponseWriter, _ *http.Request) {
@@ -295,19 +343,31 @@ func (d *daemon) allocateSlotLocked(id string) (int, error) {
 }
 
 func (d *daemon) newSession(req runtimeproto.CreateSessionRequest, slot int, token string) *runtimeproto.Session {
-	base := uint32(10)<<24 | uint32(200)<<16 | uint32(slot*4)
+	s := &runtimeproto.Session{
+		SessionID: req.SessionID, Runtime: req.Runtime, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB,
+		AgentToken: token, Slot: slot, NetworkPolicy: req.NetworkPolicy,
+	}
+	d.applyDerivedFields(s)
+	return s
+}
+
+// applyDerivedFields recomputes every host path, address, UID, and interface
+// name from the session's ID, slot, and runtime. All of these are
+// non-authoritative when persisted: on reconciliation we overwrite whatever is
+// on disk with freshly derived values, so a tampered state file can never point
+// destructive operations (RemoveAll, nft, ip) at attacker-chosen host paths.
+func (d *daemon) applyDerivedFields(s *runtimeproto.Session) {
+	base := uint32(10)<<24 | uint32(200)<<16 | uint32(s.Slot*4)
 	gw := netip.AddrFrom4([4]byte{byte(base >> 24), byte(base >> 16), byte(base >> 8), byte(base + 1)})
 	guest := netip.AddrFrom4([4]byte{byte(base >> 24), byte(base >> 16), byte(base >> 8), byte(base + 2)})
-	short := shortID(req.SessionID)
-	uid := 200000 + slot
-	return &runtimeproto.Session{
-		SessionID: req.SessionID, Runtime: req.Runtime, VCPUs: req.VCPUs, MemoryMiB: req.MemoryMiB,
-		GuestIP: guest.String(), GatewayIP: gw.String(), AgentToken: token, Slot: slot, UID: uid,
-		NetNS: "sh-" + short, HostVeth: "sv" + short,
-		DiskPath:      filepath.Join(d.config.DataDir, "instances", req.SessionID, "rootfs.ext4"),
-		JailRoot:      filepath.Join(d.config.JailDir, filepath.Base(d.config.FirecrackerBinary), req.SessionID, "root"),
-		NetworkPolicy: req.NetworkPolicy,
-	}
+	short := shortID(s.SessionID)
+	s.GuestIP = guest.String()
+	s.GatewayIP = gw.String()
+	s.UID = 200000 + s.Slot
+	s.NetNS = "sh-" + short
+	s.HostVeth = "sv" + short
+	s.DiskPath = filepath.Join(d.config.DataDir, "instances", s.SessionID, "rootfs.ext4")
+	s.JailRoot = filepath.Join(d.config.JailDir, filepath.Base(d.config.FirecrackerBinary), s.SessionID, "root")
 }
 
 func (d *daemon) createSessionResources(ctx context.Context, s *runtimeproto.Session, req runtimeproto.CreateSessionRequest) error {
@@ -406,7 +466,7 @@ func (d *daemon) startFirecracker(ctx context.Context, s *runtimeproto.Session) 
 		"--id", s.SessionID, "--exec-file", d.config.FirecrackerBinary, "--uid", strconv.Itoa(s.UID), "--gid", strconv.Itoa(s.UID),
 		"--chroot-base-dir", d.config.JailDir, "--netns", filepath.Join("/run/netns", s.NetNS), "--new-pid-ns",
 		"--cgroup-version", "2", "--parent-cgroup", "sandbox-host",
-		"--cgroup", "memory.max=" + strconv.Itoa((s.MemoryMiB+256)*1024*1024), "--cgroup", "pids.max=2048", "--cgroup", "cpu.max=" + quota,
+		"--cgroup", "memory.max=" + strconv.Itoa((s.MemoryMiB+perGuestOverheadMiB)*1024*1024), "--cgroup", "pids.max=2048", "--cgroup", "cpu.max=" + quota,
 		"--resource-limit", "no-file=4096", "--resource-limit", "fsize=" + strconv.FormatInt(64<<30, 10), "--daemonize",
 	}
 	if err := run(ctx, d.config.JailerBinary, args...); err != nil {
@@ -506,7 +566,10 @@ func (d *daemon) stopAndSnapshot(ctx context.Context, s *runtimeproto.Session, r
 		io.Copy(io.Discard, response.Body)
 		response.Body.Close()
 	}
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the guest to sync and power off (its cgroup drains) so a snapshot
+	// captures a quiesced filesystem rather than a mid-write image. A hostile
+	// guest that refuses to exit is force-killed by cleanupSession on timeout.
+	d.waitForCgroupEmpty(s.SessionID, 8*time.Second)
 	if err := d.cleanupSession(ctx, s, false); err != nil {
 		d.logger.Warn("session cleanup incomplete", "session", s.SessionID, "error", err)
 	}
@@ -534,6 +597,18 @@ func (d *daemon) stopAndSnapshot(ctx context.Context, s *runtimeproto.Session, r
 		_ = os.RemoveAll(filepath.Dir(s.DiskPath))
 	}
 	return result, nil
+}
+
+func (d *daemon) waitForCgroupEmpty(sessionID string, timeout time.Duration) {
+	procs := filepath.Join("/sys/fs/cgroup/sandbox-host", sessionID, "cgroup.procs")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(procs)
+		if err != nil || len(bytes.TrimSpace(b)) == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (d *daemon) cleanupSession(ctx context.Context, s *runtimeproto.Session, removeDisk bool) error {
@@ -646,6 +721,14 @@ func (d *daemon) reconcileStartup() error {
 		if err := json.Unmarshal(b, &s); err != nil {
 			return err
 		}
+		// Trust only validated scalars from persisted state; derive every host
+		// path/address/interface from them so a tampered record cannot redirect
+		// privileged cleanup at arbitrary paths (see applyDerivedFields).
+		if !safeID.MatchString(s.SessionID) || s.Slot < 1 || s.Slot >= 16383 || !contains(d.config.AllowedRuntimes, s.Runtime) {
+			d.logger.Error("rejecting malformed persisted session", "file", entry.Name(), "session", s.SessionID)
+			continue
+		}
+		d.applyDerivedFields(&s)
 		if d.sessionAlive(&s) {
 			if _, exists := d.slots[s.Slot]; exists {
 				return fmt.Errorf("duplicate persisted slot %d", s.Slot)

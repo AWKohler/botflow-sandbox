@@ -6,7 +6,14 @@ Wants=network-online.target
 
 [Service]
 User=sandbox-egress
-Group=sandbox-host
+Group=sandbox-egress
+# Private per-service runtime dir (/run/sandbox-egress, 0700). The control
+# socket and policy state live here so only this user and root (which sandboxd
+# runs as) can reach them; the API user cannot, keeping the egress<->runtime
+# control path off-limits to a compromised API.
+RuntimeDirectory=sandbox-egress
+RuntimeDirectoryMode=0700
+Environment=SANDBOX_EGRESS_SOCKET=/run/sandbox-egress/egress.sock
 ExecStart=/usr/lib/sandbox-host/egressd
 Restart=on-failure
 RestartSec=2s
@@ -23,9 +30,14 @@ RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/run/sandbox-host
-UMask=0007
+ReadWritePaths=/run/sandbox-egress
+# Resource ceilings: the egress proxy handles hostile guest traffic directly, so
+# cap its memory, task, and file-descriptor use to contain connection/DNS floods
+# even if the in-process limits are exceeded.
+MemoryMax=1G
+TasksMax=4096
+LimitNOFILE=32768
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
-

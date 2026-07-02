@@ -49,6 +49,11 @@ func (a *api) createSandbox(w http.ResponseWriter, r *http.Request) {
 		httpjson.WriteError(w, 400, "invalid_name", "sandbox name must contain letters, numbers, or hyphens")
 		return
 	}
+	// Serialize create/resume against a per-name lock so two concurrent creates
+	// (or a create racing a resume) cannot both pass the existence/quota check
+	// and each spawn a VM, orphaning all but the last-persisted one.
+	unlock := a.lockName(principal.TeamID, req.ProjectID, name)
+	defer unlock()
 	if _, err := a.store.GetSandbox(principal.TeamID, req.ProjectID, name); err == nil {
 		httpjson.WriteError(w, 409, "sandbox_exists", "sandbox name already exists")
 		return
@@ -233,12 +238,22 @@ func (a *api) getSandbox(w http.ResponseWriter, r *http.Request) {
 	resume := r.URL.Query().Get("resume") != "false"
 	resumed := false
 	if resume && record.Sandbox.Status == "stopped" {
-		record, err = a.resumeSandbox(r.Context(), record)
-		if err != nil {
-			httpjson.WriteError(w, 503, "sandbox_resume_failed", err.Error())
-			return
+		unlock := a.lockName(record.OwnerID, record.ProjectID, record.Sandbox.Name)
+		// Re-read under the lock: a concurrent resume may have already started
+		// the sandbox while we waited, in which case we must not resume again.
+		if current, cerr := a.store.GetSandbox(p.TeamID, project, record.Sandbox.Name); cerr == nil {
+			record = current
 		}
-		resumed = true
+		if record.Sandbox.Status == "stopped" {
+			record, err = a.resumeSandbox(r.Context(), record)
+			if err != nil {
+				unlock()
+				httpjson.WriteError(w, 503, "sandbox_resume_failed", err.Error())
+				return
+			}
+			resumed = true
+		}
+		unlock()
 	}
 	writeJSON(w, 200, map[string]any{"sandbox": record.Sandbox, "session": record.Session, "routes": routesOrEmpty(record.Routes), "resumed": resumed})
 }

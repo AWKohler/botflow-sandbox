@@ -6,11 +6,15 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
+# The ruleset file is idempotent and atomic, so start and reload are identical
+# and never open a gap. Reload preserves the live guest-interface set.
 ExecStart=/usr/sbin/nft -f /etc/sandbox-host/nftables.conf
-ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet sandbox_host 2>/dev/null || true; /usr/sbin/nft -f /etc/sandbox-host/nftables.conf'
-ExecStop=/usr/sbin/nft delete table inet sandbox_host
+ExecReload=/usr/sbin/nft -f /etc/sandbox-host/nftables.conf
+# No ExecStop: intentionally leave the drop rules in force even when the unit is
+# stopped, so a stray `systemctl stop` can never fail the firewall open while
+# hostile guests are still running. Rules are cleared only by a reboot, after
+# which ExecStart reinstalls them before any VM can start.
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-

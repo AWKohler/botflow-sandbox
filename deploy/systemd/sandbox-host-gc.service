@@ -1,7 +1,9 @@
 [Unit]
-Description=Sandbox Host garbage collection placeholder
+Description=Sandbox Host stale temp-file sweep
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/find /var/lib/sandbox-host/runtime -type f -name '*.tmp' -mmin +60 -delete
-
+# Snapshot expiration/retention is enforced by the API gc loop and orphaned
+# instances by sandboxd reconciliation; this only sweeps interrupted atomic
+# writes (*.tmp) left by a crash mid-rename.
+ExecStart=/usr/bin/find /var/lib/sandbox-host -type f -name '*.tmp' -mmin +60 -delete

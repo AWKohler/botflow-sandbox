@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# SECURITY NOTE: this builder runs apt/dpkg maintainer scripts and `npm install`
+# as root inside a chroot. A chroot is not a security boundary, so this script
+# must only be run on a trusted host against trusted package sources (all
+# artifacts here are pinned and checksum-verified). To reduce exposure we mount a
+# minimal synthetic /dev rather than bind-mounting the host's real device tree,
+# so build-time code cannot reach host block devices.
+
 DATA_DIR=${DATA_DIR:-/var/lib/sandbox-host}
 MOUNT_DIR=/mnt/sandbox-host-rootfs
 BASE_IMAGE="$DATA_DIR/images/base.ext4"
@@ -13,7 +20,8 @@ PY_ASSET='cpython-3.13.14+20260623-x86_64-unknown-linux-gnu-install_only_strippe
 
 cleanup() {
   mountpoint -q "$MOUNT_DIR/dev/pts" && umount "$MOUNT_DIR/dev/pts" || true
-  mountpoint -q "$MOUNT_DIR/dev" && umount "$MOUNT_DIR/dev" || true
+  mountpoint -q "$MOUNT_DIR/dev/shm" && umount "$MOUNT_DIR/dev/shm" || true
+  mountpoint -q "$MOUNT_DIR/dev" && umount -l "$MOUNT_DIR/dev" || true
   mountpoint -q "$MOUNT_DIR/proc" && umount "$MOUNT_DIR/proc" || true
   mountpoint -q "$MOUNT_DIR/sys" && umount "$MOUNT_DIR/sys" || true
   mountpoint -q "$MOUNT_DIR" && umount "$MOUNT_DIR" || true
@@ -35,10 +43,21 @@ else
   debootstrap --variant=minbase noble "$MOUNT_DIR" http://archive.ubuntu.com/ubuntu
   fresh=1
 fi
-mount --bind /dev "$MOUNT_DIR/dev"
-mount --bind /dev/pts "$MOUNT_DIR/dev/pts"
+# Minimal synthetic /dev: a fresh tmpfs with only the character devices apt,
+# dpkg, and npm actually need — not a bind of the host's real /dev.
+mount -t tmpfs -o mode=0755,nosuid tmpfs "$MOUNT_DIR/dev"
+mknod -m 0666 "$MOUNT_DIR/dev/null" c 1 3
+mknod -m 0666 "$MOUNT_DIR/dev/zero" c 1 5
+mknod -m 0666 "$MOUNT_DIR/dev/full" c 1 7
+mknod -m 0666 "$MOUNT_DIR/dev/random" c 1 8
+mknod -m 0666 "$MOUNT_DIR/dev/urandom" c 1 9
+mknod -m 0666 "$MOUNT_DIR/dev/tty" c 5 0
+mkdir -p "$MOUNT_DIR/dev/pts" "$MOUNT_DIR/dev/shm"
+mount -t devpts -o nosuid,noexec,newinstance,ptmxmode=0666 devpts "$MOUNT_DIR/dev/pts"
+ln -sf /dev/pts/ptmx "$MOUNT_DIR/dev/ptmx"
+mount -t tmpfs -o nosuid,nodev tmpfs "$MOUNT_DIR/dev/shm"
 mount -t proc proc "$MOUNT_DIR/proc"
-mount -t sysfs sysfs "$MOUNT_DIR/sys"
+mount -t sysfs -o ro sysfs "$MOUNT_DIR/sys"
 
 install -m 0755 "$AGENT" "$MOUNT_DIR/usr/local/bin/sandbox-agent"
 if [[ $fresh == 1 ]]; then
@@ -110,6 +129,7 @@ printf 'sandbox-host\n' > "$MOUNT_DIR/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 sandbox-host\n' > "$MOUNT_DIR/etc/hosts"
 sync
 umount "$MOUNT_DIR/dev/pts"
+umount "$MOUNT_DIR/dev/shm"
 umount "$MOUNT_DIR/dev"
 umount "$MOUNT_DIR/proc"
 umount "$MOUNT_DIR/sys"

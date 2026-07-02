@@ -25,9 +25,12 @@ import (
 )
 
 const (
-	maxInitialBytes = 64 << 10
-	connectTimeout  = 10 * time.Second
-	idleTimeout     = 2 * time.Minute
+	maxInitialBytes   = 64 << 10
+	connectTimeout    = 10 * time.Second
+	idleTimeout       = 2 * time.Minute
+	maxConnsPerSource = 256
+	maxTotalConns     = 8192
+	maxInflightDNS    = 2048
 )
 
 type server struct {
@@ -37,6 +40,11 @@ type server struct {
 	policies  map[string]egress.SessionPolicy
 	upstream  string
 	statePath string
+
+	connMu    sync.Mutex
+	connBySrc map[string]int
+	connTotal int
+	dnsTokens chan struct{}
 }
 
 func main() {
@@ -65,6 +73,7 @@ func main() {
 	s := &server{
 		logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), ceiling: config.Ceiling,
 		policies: make(map[string]egress.SessionPolicy), upstream: config.DNSUpstream, statePath: config.StatePath,
+		connBySrc: make(map[string]int), dnsTokens: make(chan struct{}, maxInflightDNS),
 	}
 	if err := s.loadPolicies(); err != nil {
 		panic(fmt.Errorf("load egress state: %w", err))
@@ -221,21 +230,74 @@ func (s *server) policyFor(remote net.Addr) (egress.SessionPolicy, bool) {
 	return policy, ok
 }
 
+// admitConn enforces a per-guest and global concurrent-connection ceiling so a
+// hostile guest cannot exhaust host memory or file descriptors by opening a
+// flood of allowed connections. releaseConn must be called for each admission.
+func (s *server) admitConn(src string) bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.connTotal >= maxTotalConns || s.connBySrc[src] >= maxConnsPerSource {
+		return false
+	}
+	s.connBySrc[src]++
+	s.connTotal++
+	return true
+}
+
+func (s *server) releaseConn(src string) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.connBySrc[src] > 0 {
+		s.connBySrc[src]--
+		if s.connBySrc[src] == 0 {
+			delete(s.connBySrc, src)
+		}
+		s.connTotal--
+	}
+}
+
+func sourceHost(addr net.Addr) string {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
 func (s *server) serveTCP(ctx context.Context, address string, handler func(net.Conn)) error {
 	ln, err := net.Listen("tcp4", address)
 	if err != nil {
 		return err
 	}
 	go func() { <-ctx.Done(); _ = ln.Close() }()
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			// Back off on transient accept errors (e.g. EMFILE) instead of
+			// spinning in a tight retry loop that pins a CPU.
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff < time.Second {
+				backoff *= 2
+			}
+			time.Sleep(backoff)
 			continue
 		}
-		go handler(conn)
+		backoff = 0
+		src := sourceHost(conn.RemoteAddr())
+		if !s.admitConn(src) {
+			s.deny("tcp", conn.RemoteAddr(), "", "connection_limit")
+			_ = conn.Close()
+			continue
+		}
+		go func() {
+			defer s.releaseConn(src)
+			handler(conn)
+		}()
 	}
 }
 
@@ -275,7 +337,19 @@ func (s *server) handleHTTP(client net.Conn) {
 	}
 	_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
 	initial, method, path, host, err := readHTTPHeader(client)
-	if err != nil || !policy.Policy.Allows(host, method, path) {
+	if err != nil {
+		s.deny("http", client.RemoteAddr(), host, "request_denied")
+		return
+	}
+	// Pin plaintext egress to port 80. Without this a guest could smuggle an
+	// arbitrary port into the Host header (e.g. "registry.npmjs.org:22") and
+	// open a raw TCP tunnel to any port on an otherwise-allowlisted domain.
+	host, portOK := httpHostPort80(host)
+	if !portOK {
+		s.deny("http", client.RemoteAddr(), host, "port_denied")
+		return
+	}
+	if !policy.Policy.Allows(host, method, path) {
 		s.deny("http", client.RemoteAddr(), host, "request_denied")
 		return
 	}
@@ -309,7 +383,18 @@ func (s *server) serveDNSUDP(ctx context.Context, address string) error {
 			continue
 		}
 		packet := append([]byte(nil), buf[:n]...)
-		go s.handleDNSPacket(conn, remote, packet)
+		// Bound concurrent DNS handlers so a UDP flood cannot spawn unbounded
+		// goroutines; excess queries are dropped rather than amplified.
+		select {
+		case s.dnsTokens <- struct{}{}:
+		default:
+			s.deny("dns", remote, "", "dns_rate_limit")
+			continue
+		}
+		go func() {
+			defer func() { <-s.dnsTokens }()
+			s.handleDNSPacket(conn, remote, packet)
+		}()
 	}
 }
 
@@ -343,6 +428,47 @@ func (s *server) deny(protocol string, remote net.Addr, host, reason string) {
 	s.logger.Warn("egress_denied", "protocol", protocol, "source", remote.String(), "host", host, "reason", reason)
 }
 
+// localHostAddresses is the set of IPs assigned to this host's interfaces,
+// snapshotted at startup. dialPublic refuses to connect to any of them so that
+// an allowlisted hostname which is rebound (DNS) to one of the host's own
+// public/Tailnet addresses cannot be used to reach host-local services.
+var localHostAddresses = loadLocalHostAddresses()
+
+func loadLocalHostAddresses() map[netip.Addr]struct{} {
+	set := make(map[netip.Addr]struct{})
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return set
+	}
+	for _, a := range addrs {
+		if ipNet, ok := a.(*net.IPNet); ok {
+			if addr, ok := netip.AddrFromSlice(ipNet.IP); ok {
+				set[addr.Unmap()] = struct{}{}
+			}
+		}
+	}
+	return set
+}
+
+func isLocalHostAddress(addr netip.Addr) bool {
+	_, ok := localHostAddresses[addr.Unmap()]
+	return ok
+}
+
+// httpHostPort80 strips an explicit :80 from a Host header and rejects any
+// other explicit port, so plaintext egress can only ever target port 80 of an
+// allowlisted domain.
+func httpHostPort80(host string) (string, bool) {
+	h, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return host, true // no explicit port
+	}
+	if port != "80" {
+		return host, false
+	}
+	return h, true
+}
+
 func dialPublic(host, defaultPort string) (net.Conn, error) {
 	host = strings.TrimSpace(strings.ToLower(strings.TrimSuffix(host, ".")))
 	if h, port, err := net.SplitHostPort(host); err == nil {
@@ -360,7 +486,7 @@ func dialPublic(host, defaultPort string) (net.Conn, error) {
 	dialer := net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	var errs []error
 	for _, addr := range addrs {
-		if !egress.IsPublicAddress(addr) {
+		if !egress.IsPublicAddress(addr) || isLocalHostAddress(addr) {
 			continue
 		}
 		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), defaultPort))

@@ -11,3 +11,9 @@ coverage/
 !.env.example
 
 node_modules/
+
+# stray build artifacts
+/egressd
+/sandboxd
+/sandbox-api
+/guest-agent

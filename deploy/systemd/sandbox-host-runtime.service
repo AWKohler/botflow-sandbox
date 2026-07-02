@@ -1,11 +1,14 @@
 [Unit]
 Description=Sandbox Host Firecracker runtime daemon
-After=network-online.target sandbox-host-egress.service
+After=network-online.target sandbox-host-firewall.service sandbox-host-egress.service
+# Require the firewall: if the guest drop rules cannot be installed, refuse to
+# start the runtime so a VM can never boot without host isolation in force.
+Requires=sandbox-host-firewall.service
 Wants=network-online.target sandbox-host-egress.service
 
 [Service]
 User=root
-Group=sandbox-host
+Group=root
 ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/sandbox-host
 ExecStart=/usr/lib/sandbox-host/sandboxd
 Restart=on-failure
@@ -13,7 +16,7 @@ RestartSec=2s
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/sandbox-host /srv/jailer /run/sandbox-host /run/netns /sys/fs/cgroup
+ReadWritePaths=/var/lib/sandbox-host /srv/jailer /run/sandbox-host /run/sandbox-egress /run/netns /sys/fs/cgroup
 PrivateDevices=no
 ProtectControlGroups=no
 ProtectKernelModules=no

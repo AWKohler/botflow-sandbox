@@ -19,6 +19,19 @@ type runtimeClient struct{ socket string }
 func (c runtimeClient) do(ctx context.Context, method, path string, body, out any) error {
 	return unixRequest(ctx, c.socket, method, path, body, out)
 }
+func (c runtimeClient) sessions(ctx context.Context) (map[string]bool, error) {
+	var out struct {
+		Sessions []string `json:"sessions"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/v1/sessions", nil, &out); err != nil {
+		return nil, err
+	}
+	set := make(map[string]bool, len(out.Sessions))
+	for _, id := range out.Sessions {
+		set[id] = true
+	}
+	return set, nil
+}
 func (c runtimeClient) create(ctx context.Context, body runtimeproto.CreateSessionRequest) (runtimeproto.Session, error) {
 	var out runtimeproto.Session
 	err := c.do(ctx, http.MethodPost, "/v1/sessions", body, &out)
