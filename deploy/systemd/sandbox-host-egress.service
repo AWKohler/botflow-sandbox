@@ -1,0 +1,31 @@
+[Unit]
+Description=Sandbox Host egress policy gateway
+After=network-online.target sandbox-host-firewall.service
+Requires=sandbox-host-firewall.service
+Wants=network-online.target
+
+[Service]
+User=sandbox-egress
+Group=sandbox-host
+ExecStart=/usr/lib/sandbox-host/egressd
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/sandbox-host
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target
+

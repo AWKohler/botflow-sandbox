@@ -1,0 +1,16 @@
+[Unit]
+Description=Sandbox Host isolated guest firewall
+Before=sandbox-host-egress.service sandbox-host-runtime.service
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/sandbox-host/nftables.conf
+ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet sandbox_host 2>/dev/null || true; /usr/sbin/nft -f /etc/sandbox-host/nftables.conf'
+ExecStop=/usr/sbin/nft delete table inet sandbox_host
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+

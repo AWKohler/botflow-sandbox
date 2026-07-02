@@ -1,0 +1,13 @@
+vercel-sandbox-reference/
+.build/
+dist/
+coverage/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+.env.*
+!.env.example
+
+node_modules/

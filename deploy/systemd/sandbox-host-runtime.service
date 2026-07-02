@@ -1,0 +1,26 @@
+[Unit]
+Description=Sandbox Host Firecracker runtime daemon
+After=network-online.target sandbox-host-egress.service
+Wants=network-online.target sandbox-host-egress.service
+
+[Service]
+User=root
+Group=sandbox-host
+ExecStartPre=/bin/mkdir -p /sys/fs/cgroup/sandbox-host
+ExecStart=/usr/lib/sandbox-host/sandboxd
+Restart=on-failure
+RestartSec=2s
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sandbox-host /srv/jailer /run/sandbox-host /run/netns /sys/fs/cgroup
+PrivateDevices=no
+ProtectControlGroups=no
+ProtectKernelModules=no
+ProtectKernelTunables=no
+NoNewPrivileges=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

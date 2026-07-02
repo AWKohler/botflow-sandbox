@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Sandbox Host garbage collection
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
+

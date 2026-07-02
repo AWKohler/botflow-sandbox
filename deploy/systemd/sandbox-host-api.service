@@ -1,0 +1,30 @@
+[Unit]
+Description=Sandbox Host Vercel-compatible API
+After=network-online.target sandbox-host-runtime.service
+Requires=sandbox-host-runtime.service
+Wants=network-online.target
+
+[Service]
+User=sandbox-api
+Group=sandbox-host
+ExecStart=/usr/lib/sandbox-host/sandbox-api
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/sandbox-host
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target
+

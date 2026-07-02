@@ -1,0 +1,104 @@
+import zlib from "zlib";
+import tar, { type Pack } from "tar-stream";
+import { Readable } from "stream";
+
+interface FileData {
+  /**
+   * The name (path) of the file to write.
+   */
+  name: string;
+  /**
+   * The content of the file.
+   */
+  content: string | Uint8Array;
+  /**
+   * The file mode (permissions) to set on the file.
+   * For example, 0o755 for executable files.
+   */
+  mode?: number;
+}
+
+interface FileStream {
+  /**
+   * The name (path) of the file to write.
+   */
+  name: string;
+  /**
+   * A Readable stream to consume the content of the file.
+   */
+  content: Readable;
+  /**
+   * The expected size of the file. This is required to write
+   * the header of the compressed file.
+   */
+  size: number;
+  /**
+   * The file mode (permissions) to set on the file.
+   * For example, 0o755 for executable files.
+   */
+  mode?: number;
+}
+
+/**
+ * Allows to create a Readable stream with methods to write files
+ * to it and to finish it. Files written are compressed together
+ * and gzipped in the stream.
+ */
+export class FileWriter {
+  public readable: Readable;
+  private pack: Pack;
+
+  constructor() {
+    const gzip = zlib.createGzip();
+    this.pack = tar.pack();
+    this.readable = this.pack.pipe(gzip);
+  }
+
+  /**
+   * Allows to add a file to the stream. Size is required to write
+   * the tarball header so when content is a stream it must be
+   * provided.
+   *
+   * Returns a Promise resolved once the file is written in the
+   * stream.
+   */
+  async addFile(file: FileData | FileStream) {
+    return new Promise<void>((resolve, reject) => {
+      const entry = this.pack.entry(
+        "size" in file
+          ? { name: file.name, size: file.size, mode: file.mode }
+          : {
+              name: file.name,
+              size: Buffer.byteLength(file.content),
+              mode: file.mode,
+            },
+        (error) => {
+          if (error) {
+            return reject(error);
+          } else {
+            resolve();
+          }
+        },
+      );
+
+      if (file.content instanceof Readable) {
+        file.content.pipe(entry);
+      } else {
+        entry.end(file.content);
+      }
+    });
+  }
+
+  /**
+   * Allows to finish the stream returning a Promise that will
+   * resolve once the readable is effectively closed or
+   * errored.
+   */
+  async end() {
+    return new Promise<void>((resolve, reject) => {
+      this.readable.on("error", reject);
+      this.readable.on("end", resolve);
+      this.pack.finalize();
+    });
+  }
+}

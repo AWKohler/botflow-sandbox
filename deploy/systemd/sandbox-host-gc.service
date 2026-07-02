@@ -1,0 +1,7 @@
+[Unit]
+Description=Sandbox Host garbage collection placeholder
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find /var/lib/sandbox-host/runtime -type f -name '*.tmp' -mmin +60 -delete
+
