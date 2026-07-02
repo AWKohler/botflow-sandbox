@@ -3,10 +3,17 @@
 ## Host layout
 
 - `/usr/lib/sandbox-host/` — versioned, root-owned binaries and guest kernel
-- `/etc/sandbox-host/` — root-owned configuration; secrets mode `0600`
-- `/var/lib/sandbox-host/` — dedicated Btrfs loopback mount for images, instances, snapshots, logs, and SQLite backup
-- `/run/sandbox-host/` — runtime sockets and namespace metadata
-- `/var/log/sandbox-host/` — structured service/audit logs with rotation
+- `/etc/sandbox-host/` — configuration, mode `0640`, each file group-readable
+  only by its owning service; the operator token file is `0600`
+- `/var/lib/sandbox-host/` — dedicated Btrfs loopback mount. **Root-owned**
+  (`0755`); `images/instances/snapshots/runtime/jailer` are root-only `0750`;
+  `api/` is the API's private `0700` directory holding the BoltDB metadata store
+  (`api.db`). No service user can rename or replace the runtime-state dirs.
+- `/run/sandbox-host/` — root-owned; holds only `sandboxd.sock`
+  (`root:sandbox-api 0660`)
+- `/run/sandbox-egress/` — the egress service's private runtime dir (`0700`);
+  holds `egress.sock` and the persisted policy state, reachable only by the
+  egress user and root
 
 ## Network exposure
 
@@ -14,11 +21,21 @@ The initial API and preview router bind only to loopback and/or the Tailscale ad
 
 ## Service units
 
-- `sandbox-host-api.service` — unprivileged, restart-on-failure, filesystem and syscall hardening
-- `sandbox-host-runtime.service` — privileged but capability-bounded where practical
-- `sandbox-host-egress.service` — unprivileged; no write access outside its runtime directory
-- `sandbox-host-gc.timer` — expired sessions/snapshots and orphan jail cleanup
-- `sandbox-host-health.timer` — image/kernel version, disk, cgroup, KVM, nftables, and API checks
+- `sandbox-host-firewall.service` — oneshot; installs the idempotent atomic
+  nftables ruleset. No `ExecStop` (rules stay in force even if the unit is
+  stopped) so it can never fail open while guests run.
+- `sandbox-host-egress.service` — unprivileged; private `RuntimeDirectory`;
+  `MemoryMax`/`TasksMax`/`LimitNOFILE` ceilings; `Requires` the firewall
+- `sandbox-host-runtime.service` — privileged; **`Requires` the firewall** so a
+  VM cannot boot without guest drop-rules in force
+- `sandbox-host-api.service` — unprivileged, dedicated group, writable only in
+  its DB subdir, `MemoryMax`/`TasksMax`/`LimitNOFILE` ceilings
+- `sandbox-host-gc.timer` — sweeps interrupted `*.tmp` writes (snapshot
+  expiry/retention is enforced by the API GC loop; orphaned instances by
+  `sandboxd` reconciliation)
+
+Startup order is `firewall → egress → runtime → api`, enforced by unit
+dependencies.
 
 ## Recovery invariants
 
