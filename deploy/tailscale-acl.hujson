@@ -1,0 +1,54 @@
+// Tailscale tailnet policy for the Sandbox Host preview isolation.
+//
+// Apply via the admin console (Access Controls) or the Tailscale API
+//   PUT https://api.tailscale.com/api/v2/tailnet/<tailnet>/acl
+// The `tailscale` CLI on a node CANNOT edit this file.
+//
+// Goal: only the designated preview consumer (tag:platform) may reach the
+// sandbox host's preview port range (20000-40000). Your own admin devices keep
+// full access (SSH + API + previews) for operation and debugging.
+//
+// IMPORTANT: this tags the sandbox host as tag:sandbox-host. Applying a tag
+// requires re-authenticating the node:
+//     tailscale up --advertise-tags=tag:sandbox-host
+// Because SSH to the host runs over Tailscale, make sure the admin SSH rule
+// below is in the policy BEFORE you tag, or you can lock yourself out.
+{
+  "tagOwners": {
+    "tag:sandbox-host": ["autogroup:admin"],
+    "tag:platform":     ["autogroup:admin"],
+  },
+
+  "acls": [
+    // Your own (human-owned, untagged) devices keep talking to each other freely.
+    // Tagged nodes are excluded from autogroup:member, so this does NOT reopen
+    // the sandbox host.
+    { "action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:member:*"] },
+
+    // Admin devices -> sandbox host: SSH (22), API over Tailscale Serve (443),
+    // and previews (20000-40000) for debugging.
+    {
+      "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": ["tag:sandbox-host:22", "tag:sandbox-host:443", "tag:sandbox-host:20000-40000"],
+    },
+
+    // Preview consumer (whatever node you assign tag:platform) -> sandbox host:
+    // the API and the preview range ONLY. No SSH, no other ports.
+    {
+      "action": "accept",
+      "src": ["tag:platform"],
+      "dst": ["tag:sandbox-host:443", "tag:sandbox-host:20000-40000"],
+    },
+  ],
+
+  // Keep Tailscale SSH working to the host for your admin devices.
+  "ssh": [
+    {
+      "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": ["tag:sandbox-host"],
+      "users": ["ai-club-pc", "root"],
+    },
+  ],
+}

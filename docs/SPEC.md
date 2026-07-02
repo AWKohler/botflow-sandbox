@@ -250,7 +250,7 @@ resolved or explicitly documented:
 | 5 | Create/resume admission races orphaned VMs | **Fixed** — per-name lifecycle lock |
 | 6 | No storage quota / snapshot GC | **Fixed** — snapshot expiry+retention GC loop; free-space admission ceiling |
 | 7 | Egress had no connection/DNS ceilings | **Fixed** — per-source + global conn caps, bounded DNS fan-out, accept backoff, systemd Memory/Tasks/NOFILE limits |
-| 8 | Preview routes unauthenticated | **Documented** — bound only to the tailnet IP; guests cannot reach the tailnet; recommend Tailscale ACLs scoping the preview port range to the platform host (full capability-token router deferred to avoid breaking `.domain()` compat) |
+| 8 | Preview routes unauthenticated | **Documented + tooling** — bound only to the tailnet IP; guests cannot reach the tailnet. Scoping the preview range to a consumer is a one-command switch: host-local `deploy/scope-previews.sh enable <ip…>` (nftables on `tailscale0`, staged on the host, not yet activated), or the drafted central policy in `deploy/tailscale-acl.hujson`. A per-route capability router is deferred to avoid breaking `.domain()` compat |
 | 9 | Rootfs build ran package code as root with host `/dev` | **Mitigated** — minimal synthetic `/dev`; build-time trust assumption documented |
 | 10 | `IsPublicAddress` allowed host's own IPs | **Fixed** — deny any host-assigned address on connect |
 | 11 | Snapshot not quiesced (fixed 500 ms) | **Fixed** — wait for guest cgroup to drain before copy |
@@ -260,8 +260,12 @@ resolved or explicitly documented:
 
 - **TLS domain-fronting / HTTP keep-alive re-use** on shared CDN infrastructure
   is not prevented (would require a TLS-terminating egress CA). Documented in §5.
-- **Preview isolation** relies on tailnet trust + recommended ACLs rather than
-  per-route capability tokens (§9 #8).
+- **Preview isolation** relies on tailnet trust rather than per-route capability
+  tokens (§9 #8). To scope the preview range to a specific consumer once one
+  exists on the tailnet, run `sudo /usr/lib/sandbox-host/scope-previews.sh enable
+  <tailnet-ip>` (host-local nftables, reversible with `disable`), or apply
+  `deploy/tailscale-acl.hujson` centrally. Currently unscoped by design (no
+  tailnet preview consumer exists yet).
 - **Live flow revocation** on policy narrowing is not implemented; narrowed
   policies apply to new connections, and existing flows idle-time out (2 min).
 - **Trusted computing base:** KVM, the host kernel, Firecracker, the jailer,

@@ -125,6 +125,7 @@ chown root:sandbox-egress /etc/sandbox-host/egress.json
 chown root:root /etc/sandbox-host/runtime.json /etc/sandbox-host/nftables.conf
 
 install -m 0755 "$STAGE/build-rootfs.sh" /usr/lib/sandbox-host/build-rootfs.sh
+install -m 0755 "$STAGE/scope-previews.sh" /usr/lib/sandbox-host/scope-previews.sh
 install -m 0644 "$STAGE/systemd"/*.service "$STAGE/systemd"/*.timer /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable sandbox-host-firewall.service sandbox-host-egress.service sandbox-host-runtime.service sandbox-host-api.service sandbox-host-gc.timer
