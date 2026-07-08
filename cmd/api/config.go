@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ai-club/sandbox-host/internal/egress"
 )
@@ -19,14 +20,30 @@ type apiConfig struct {
 	PreviewExternalHost string        `json:"previewExternalHost"`
 	PreviewPortStart    int           `json:"previewPortStart"`
 	PreviewPortEnd      int           `json:"previewPortEnd"`
-	DatabasePath        string        `json:"databasePath"`
-	RuntimeSocket       string        `json:"runtimeSocket"`
-	Region              string        `json:"region"`
-	DefaultTimeoutMs    int64         `json:"defaultTimeoutMs"`
-	MaxTimeoutMs        int64         `json:"maxTimeoutMs"`
-	MaxPorts            int           `json:"maxPorts"`
-	EgressCeiling       egress.Policy `json:"egressCeiling"`
-	Tokens              []tokenConfig `json:"tokens"`
+	// PreviewDomain switches preview routes to public HTTPS subdomain URLs
+	// (https://<label>.<PreviewDomain>) served by the preview router, which a
+	// Cloudflare tunnel fronts for TLS. Empty = legacy tailnet-only
+	// http://<PreviewExternalHost>:<port> URLs.
+	PreviewDomain string `json:"previewDomain"`
+	// PreviewRouterListen is the plain-HTTP address the subdomain router
+	// binds; the tunnel terminates TLS and proxies here (like Tailscale
+	// Funnel does for the control plane). Default 127.0.0.1:8090 when
+	// PreviewDomain is set.
+	PreviewRouterListen string `json:"previewRouterListen"`
+	// PreviewSigningSecret (≥32 chars) turns on signed-token auth for the
+	// preview router: requests must carry a valid `_bft` query token or
+	// `__bf_preview` cookie minted with the same secret (shared with the
+	// Botflow control plane). Empty = capability-URL-only (the unguessable
+	// subdomain is the credential, same model as Vercel preview URLs).
+	PreviewSigningSecret string        `json:"previewSigningSecret"`
+	DatabasePath         string        `json:"databasePath"`
+	RuntimeSocket        string        `json:"runtimeSocket"`
+	Region               string        `json:"region"`
+	DefaultTimeoutMs     int64         `json:"defaultTimeoutMs"`
+	MaxTimeoutMs         int64         `json:"maxTimeoutMs"`
+	MaxPorts             int           `json:"maxPorts"`
+	EgressCeiling        egress.Policy `json:"egressCeiling"`
+	Tokens               []tokenConfig `json:"tokens"`
 }
 
 type tokenConfig struct {
@@ -85,6 +102,23 @@ func loadConfig(path string) (apiConfig, error) {
 	}
 	if c.PreviewPortStart < 1024 || c.PreviewPortEnd <= c.PreviewPortStart {
 		return c, errors.New("invalid preview port range")
+	}
+	c.PreviewDomain = strings.ToLower(strings.Trim(c.PreviewDomain, "."))
+	if c.PreviewDomain != "" {
+		if strings.ContainsAny(c.PreviewDomain, " \t/:") {
+			return c, errors.New("previewDomain must be a bare domain name")
+		}
+		if c.PreviewRouterListen == "" {
+			c.PreviewRouterListen = "127.0.0.1:8090"
+		}
+	}
+	if c.PreviewSigningSecret != "" {
+		if len(c.PreviewSigningSecret) < 32 {
+			return c, errors.New("previewSigningSecret must be at least 32 characters")
+		}
+		if c.PreviewDomain == "" {
+			return c, errors.New("previewSigningSecret requires previewDomain")
+		}
 	}
 	if err := c.EgressCeiling.Validate(); err != nil {
 		return c, fmt.Errorf("invalid egress ceiling: %w", err)
