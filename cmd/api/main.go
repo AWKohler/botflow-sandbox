@@ -80,6 +80,23 @@ func main() {
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
+	if cfg.PreviewDomain != "" {
+		// Subdomain preview router: plain HTTP on localhost, fronted for TLS
+		// by the Cloudflare tunnel (see docs/preview-tunnel.md).
+		router := &http.Server{Addr: cfg.PreviewRouterListen, Handler: a.previewRouterHandler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = router.Shutdown(shutdownCtx)
+		}()
+		go func() {
+			logger.Info("preview_router_listening", "address", cfg.PreviewRouterListen, "domain", cfg.PreviewDomain, "signedTokens", cfg.PreviewSigningSecret != "")
+			if err := router.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				panic(err)
+			}
+		}()
+	}
 	logger.Info("api_listening", "address", cfg.Listen)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		panic(err)
