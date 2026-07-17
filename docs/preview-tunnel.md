@@ -1,4 +1,28 @@
-# Public HTTPS previews via Cloudflare Tunnel
+# Public HTTPS previews + control-plane via Cloudflare Tunnel
+
+> **Ingress note (2026-07-17):** the same Cloudflare tunnel now also fronts the
+> **control-plane API**. Two ingress rules, most-specific first:
+>
+> ```yaml
+> ingress:
+>   - hostname: "api.botflow-site.app"   # control plane
+>     service: http://localhost:8080
+>   - hostname: "*.botflow-site.app"     # preview router (labels are p-<hex>-<port>, no collision)
+>     service: http://localhost:8090
+>   - service: http_status:404
+> ```
+>
+> Botflow's `SANDBOX_API_URL` = `https://api.botflow-site.app/api`. `:8080` binds
+> `127.0.0.1` only, so cloudflared is its sole path in. The **Tailscale Funnel is
+> OFF** — Tailscale stays up for tailnet SSH/ops, but there is no public
+> `*.ts.net` ingress anymore. Re-enable in a pinch with
+> `tailscale funnel --https=443 on` + `tailscale serve --https=443 --bg http://127.0.0.1:8080`.
+> Security parity: both were bearer-token-gated public HTTPS; Cloudflare adds
+> WAF/DDoS/rate-limiting and hides the tailnet hostname, and collapsing to one
+> ingress shrinks the attack surface.
+
+---
+
 
 Fronts the preview ports with a Cloudflare tunnel so preview URLs become
 `https://<label>.<preview domain>` — embeddable in the Botflow workspace
